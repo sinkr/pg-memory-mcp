@@ -1,0 +1,563 @@
+#!/usr/bin/env node
+// PostgreSQL-backed memory MCP server. Drop-in replacement for
+// @modelcontextprotocol/server-memory: identical tool names and I/O shapes,
+// but state lives in Postgres so many devices/agents share one graph and
+// writes MERGE (upsert) instead of clobbering a whole JSON file.
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import pg from "pg";
+import os from "node:os";
+import fs from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 4,
+  // Fail fast when typhoon is unreachable (pg default is wait-forever, which
+  // turned "offline" into "every memory call hangs").
+  connectionTimeoutMillis: Number(process.env.PG_MEMORY_CONNECT_TIMEOUT_MS || 4000),
+  application_name: `pg-memory-mcp/${process.env.MCP_HOST || os.hostname().split(".")[0]}-${process.env.MCP_DEVICE || "unknown"}`,
+});
+
+const q = (text, params) => pool.query(text, params);
+
+// ---- SQLite mirror + outbox (offline read/write-through cache) -------------
+// Mirror: local copy of the graph, refreshed on every successful PG round-trip.
+// Outbox: ordered op-log of writes made while PG was unreachable; replayed by a
+// background loop. Replay is safe because all write ops are merge/idempotent
+// (ON CONFLICT DO NOTHING). Deletes are NOT queued offline by design.
+const MIRROR_DIR = path.join(os.homedir(), ".config", "pg-memory");
+fs.mkdirSync(MIRROR_DIR, { recursive: true });
+const mdb = new DatabaseSync(path.join(MIRROR_DIR, "mirror.sqlite"));
+mdb.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA busy_timeout = 5000;
+  CREATE TABLE IF NOT EXISTS entities(name TEXT PRIMARY KEY, entity_type TEXT);
+  CREATE TABLE IF NOT EXISTS observations(entity_name TEXT, content TEXT, PRIMARY KEY(entity_name, content));
+  CREATE TABLE IF NOT EXISTS relations(from_name TEXT, to_name TEXT, relation_type TEXT, PRIMARY KEY(from_name, to_name, relation_type));
+  CREATE TABLE IF NOT EXISTS outbox(id INTEGER PRIMARY KEY AUTOINCREMENT, tool TEXT NOT NULL, args TEXT NOT NULL,
+                                    created_at TEXT DEFAULT (datetime('now')), attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT);
+  CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT);
+`);
+
+const NET_CODES = new Set(["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "EHOSTDOWN",
+  "ENETUNREACH", "ENETDOWN", "ENOTFOUND", "EAI_AGAIN", "EPIPE"]);
+function isNetworkError(err) {
+  if (!err) return false;
+  if (NET_CODES.has(err.code)) return true;
+  if (Array.isArray(err.errors) && err.errors.some((e) => NET_CODES.has(e?.code))) return true;
+  return /timeout exceeded when trying to connect|Connection terminated/i.test(err.message || "");
+}
+
+const setMeta = (k, v) => mdb.prepare(`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`).run(k, v);
+const getMeta = (k) => mdb.prepare(`SELECT value FROM meta WHERE key=?`).get(k)?.value;
+const markSynced = () => setMeta("last_sync", new Date().toISOString());
+
+// Local (mirror) mutations — identical merge semantics to the PG impls.
+const mirror = {
+  upsertEntity(name, entityType) {
+    return mdb.prepare(`INSERT INTO entities(name, entity_type) VALUES(?,?) ON CONFLICT(name) DO NOTHING`).run(name, entityType ?? null).changes > 0;
+  },
+  addObservation(entityName, content) {
+    return mdb.prepare(`INSERT INTO observations(entity_name, content) VALUES(?,?) ON CONFLICT DO NOTHING`).run(entityName, content).changes > 0;
+  },
+  addRelation(from, to, relationType) {
+    return mdb.prepare(`INSERT INTO relations(from_name, to_name, relation_type) VALUES(?,?,?) ON CONFLICT DO NOTHING`).run(from, to, relationType).changes > 0;
+  },
+  deleteEntities(names) {
+    for (const n of names) {
+      mdb.prepare(`DELETE FROM entities WHERE name=?`).run(n);
+      mdb.prepare(`DELETE FROM observations WHERE entity_name=?`).run(n);
+      mdb.prepare(`DELETE FROM relations WHERE from_name=? OR to_name=?`).run(n, n);
+    }
+  },
+  deleteObservations(entityName, contents) {
+    for (const c of contents) mdb.prepare(`DELETE FROM observations WHERE entity_name=? AND content=?`).run(entityName, c);
+  },
+  deleteRelation(from, to, relationType) {
+    mdb.prepare(`DELETE FROM relations WHERE from_name=? AND to_name=? AND relation_type=?`).run(from, to, relationType);
+  },
+  entities(clause = "", params = []) {
+    const rows = mdb.prepare(`SELECT name, entity_type FROM entities ${clause} ORDER BY name`).all(...params);
+    const obs = mdb.prepare(`SELECT content FROM observations WHERE entity_name=? ORDER BY rowid`);
+    return rows.map((r) => ({ name: r.name, entityType: r.entity_type, observations: obs.all(r.name).map((o) => o.content) }));
+  },
+  relations(names) {
+    if (names && names.length === 0) return [];
+    let rows;
+    if (names) {
+      const ph = names.map(() => "?").join(",");
+      rows = mdb.prepare(`SELECT from_name, to_name, relation_type FROM relations WHERE from_name IN (${ph}) AND to_name IN (${ph}) ORDER BY from_name, to_name, relation_type`).all(...names, ...names);
+    } else {
+      rows = mdb.prepare(`SELECT from_name, to_name, relation_type FROM relations ORDER BY from_name, to_name, relation_type`).all();
+    }
+    return rows.map((r) => ({ from: r.from_name, to: r.to_name, relationType: r.relation_type }));
+  },
+  replaceAll(graph) {
+    mdb.exec("BEGIN");
+    try {
+      mdb.exec("DELETE FROM entities; DELETE FROM observations; DELETE FROM relations;");
+      for (const e of graph.entities) {
+        this.upsertEntity(e.name, e.entityType);
+        for (const c of e.observations || []) this.addObservation(e.name, c);
+      }
+      for (const r of graph.relations) this.addRelation(r.from, r.to, r.relationType);
+      mdb.exec("COMMIT");
+    } catch (e) {
+      mdb.exec("ROLLBACK");
+      throw e;
+    }
+  },
+  mergePartial(graph) {
+    for (const e of graph.entities) {
+      this.upsertEntity(e.name, e.entityType);
+      for (const c of e.observations || []) this.addObservation(e.name, c);
+    }
+    for (const r of graph.relations) this.addRelation(r.from, r.to, r.relationType);
+  },
+};
+
+// Local-mutation generation counter: a full mirror replace built from a PG
+// snapshot must not clobber local writes that happened after the snapshot was
+// taken (in-process race), and must never hide offline-queued rows that exist
+// only locally (cross-process race). refreshMirror handles both: merge instead
+// of replace when the generation moved, and always re-apply pending outbox ops.
+let mirrorGen = 0;
+const bumpGen = () => { mirrorGen++; };
+function reapplyOutboxLocally() {
+  for (const row of mdb.prepare(`SELECT tool, args FROM outbox ORDER BY id`).all()) {
+    const a = JSON.parse(row.args);
+    if (row.tool === "create_entities")
+      for (const e of a.entities || []) { mirror.upsertEntity(e.name, e.entityType); for (const c of e.observations || []) mirror.addObservation(e.name, c); }
+    else if (row.tool === "create_relations")
+      for (const r of a.relations || []) mirror.addRelation(r.from, r.to, r.relationType);
+    else if (row.tool === "add_observations")
+      for (const o of a.observations || []) { mirror.upsertEntity(o.entityName, null); for (const c of o.contents || []) mirror.addObservation(o.entityName, c); }
+  }
+}
+function refreshMirror(graph, genAtSnapshot) {
+  if (mirrorGen === genAtSnapshot) mirror.replaceAll(graph);
+  else mirror.mergePartial(graph); // local writes raced the snapshot — never delete
+  reapplyOutboxLocally();
+}
+
+// Never let mirror bookkeeping break the PG path.
+const safe = (fn) => { try { fn(); } catch (e) { console.error("pg-memory mirror error:", e.message); } };
+
+// Offline implementations (reads from mirror; writes -> mirror + outbox).
+const enqueue = (tool, args) => mdb.prepare(`INSERT INTO outbox(tool, args) VALUES(?,?)`).run(tool, JSON.stringify(args));
+const offlineTools = {
+  create_entities({ entities = [] }) {
+    enqueue("create_entities", { entities });
+    const created = [];
+    for (const e of entities) {
+      if (mirror.upsertEntity(e.name, e.entityType)) created.push(e);
+      for (const c of e.observations || []) mirror.addObservation(e.name, c);
+    }
+    return created;
+  },
+  create_relations({ relations = [] }) {
+    enqueue("create_relations", { relations });
+    return relations.filter((r) => mirror.addRelation(r.from, r.to, r.relationType));
+  },
+  add_observations({ observations = [] }) {
+    enqueue("add_observations", { observations });
+    return observations.map((o) => {
+      // Mirror may be stale; ensure a local anchor row so offline reads see it.
+      mirror.upsertEntity(o.entityName, null);
+      return { entityName: o.entityName, addedObservations: (o.contents || []).filter((c) => mirror.addObservation(o.entityName, c)) };
+    });
+  },
+  read_graph() {
+    return { entities: mirror.entities(), relations: mirror.relations(null) };
+  },
+  search_nodes({ query }) {
+    const like = `%${query}%`;
+    const entities = mirror.entities(
+      `WHERE lower(name) LIKE lower(?) OR lower(entity_type) LIKE lower(?)
+         OR EXISTS (SELECT 1 FROM observations o WHERE o.entity_name = entities.name AND lower(o.content) LIKE lower(?))`,
+      [like, like, like]
+    );
+    return { entities, relations: mirror.relations(entities.map((e) => e.name)) };
+  },
+  open_nodes({ names = [] }) {
+    const ph = names.map(() => "?").join(",");
+    const entities = names.length ? mirror.entities(`WHERE name IN (${ph})`, names) : [];
+    return { entities, relations: mirror.relations(names) };
+  },
+};
+
+// Write-through / refresh hooks applied after a successful PG call.
+const postSuccess = {
+  create_entities: ({ entities = [] }) => safe(() => {
+    bumpGen();
+    for (const e of entities) { mirror.upsertEntity(e.name, e.entityType); for (const c of e.observations || []) mirror.addObservation(e.name, c); }
+  }),
+  create_relations: ({ relations = [] }) => safe(() => { bumpGen(); for (const r of relations) mirror.addRelation(r.from, r.to, r.relationType); }),
+  add_observations: ({ observations = [] }) => safe(() => {
+    bumpGen();
+    for (const o of observations) { mirror.upsertEntity(o.entityName, null); for (const c of o.contents || []) mirror.addObservation(o.entityName, c); }
+  }),
+  delete_entities: ({ entityNames = [] }) => safe(() => { bumpGen(); mirror.deleteEntities(entityNames); }),
+  delete_observations: ({ deletions = [] }) => safe(() => { bumpGen(); for (const d of deletions) mirror.deleteObservations(d.entityName, d.observations || []); }),
+  delete_relations: ({ relations = [] }) => safe(() => { bumpGen(); for (const r of relations) mirror.deleteRelation(r.from, r.to, r.relationType); }),
+  read_graph: (_args, result, gen) => safe(() => refreshMirror(result, gen)),
+  search_nodes: (_args, result) => safe(() => mirror.mergePartial(result)),
+  open_nodes: (_args, result) => safe(() => mirror.mergePartial(result)),
+};
+
+// Outbox replay: runs in every server instance; double-replay across instances
+// is harmless because every queued op is idempotent on the PG side.
+let replaying = false;
+async function replayOutbox() {
+  if (replaying) return;
+  const rows = mdb.prepare(`SELECT id, tool, args, attempts FROM outbox WHERE attempts < 8 ORDER BY id`).all();
+  if (!rows.length) return;
+  replaying = true;
+  try {
+    await q("SELECT 1"); // reachability probe
+    for (const row of rows) {
+      try {
+        await tools[row.tool](JSON.parse(row.args));
+        mdb.prepare(`DELETE FROM outbox WHERE id=?`).run(row.id);
+      } catch (err) {
+        if (isNetworkError(err)) return; // lost PG again; retry next tick
+        mdb.prepare(`UPDATE outbox SET attempts=attempts+1, last_error=? WHERE id=?`).run(String(err.message || err), row.id);
+        console.error(`pg-memory outbox replay failed (id=${row.id}, ${row.tool}):`, err.message);
+      }
+    }
+    // Drained (or only poison rows left): refresh the mirror from truth.
+    const gen = mirrorGen;
+    const graph = await tools.read_graph();
+    safe(() => refreshMirror(graph, gen));
+    markSynced();
+    console.error("pg-memory outbox drained; mirror refreshed");
+  } catch {
+    /* PG still unreachable — next tick */
+  } finally {
+    replaying = false;
+  }
+}
+
+// ---- graph reads -----------------------------------------------------------
+async function entitiesWhere(clause = "", params = []) {
+  const { rows } = await q(
+    `SELECT e.name, e.entity_type AS "entityType",
+            COALESCE(array_agg(o.content ORDER BY o.id)
+                     FILTER (WHERE o.content IS NOT NULL), '{}') AS observations
+       FROM entities e
+       LEFT JOIN observations o ON o.entity_name = e.name
+       ${clause}
+       GROUP BY e.name, e.entity_type
+       ORDER BY e.name`,
+    params
+  );
+  return rows;
+}
+async function relationsAmong(names) {
+  if (names && names.length === 0) return [];
+  const { rows } = await q(
+    `SELECT from_name AS "from", to_name AS "to", relation_type AS "relationType"
+       FROM relations
+       ${names ? "WHERE from_name = ANY($1) AND to_name = ANY($1)" : ""}
+       ORDER BY from_name, to_name, relation_type`,
+    names ? [names] : []
+  );
+  return rows;
+}
+
+// ---- tool implementations --------------------------------------------------
+const tools = {
+  async create_entities({ entities = [] }) {
+    const created = [];
+    for (const e of entities) {
+      const r = await q(
+        `INSERT INTO entities(name, entity_type) VALUES ($1,$2)
+           ON CONFLICT (name) DO NOTHING RETURNING name`,
+        [e.name, e.entityType]
+      );
+      for (const c of e.observations || [])
+        await q(
+          `INSERT INTO observations(entity_name, content) VALUES ($1,$2)
+             ON CONFLICT (entity_name, content) DO NOTHING`,
+          [e.name, c]
+        );
+      if (r.rowCount) created.push(e); // newly created only, like the reference
+    }
+    return created;
+  },
+
+  async create_relations({ relations = [] }) {
+    const created = [];
+    for (const r of relations) {
+      const res = await q(
+        `INSERT INTO relations(from_name, to_name, relation_type) VALUES ($1,$2,$3)
+           ON CONFLICT DO NOTHING RETURNING 1`,
+        [r.from, r.to, r.relationType]
+      );
+      if (res.rowCount) created.push(r);
+    }
+    return created;
+  },
+
+  async add_observations({ observations = [] }) {
+    const out = [];
+    for (const o of observations) {
+      const ent = await q(`SELECT 1 FROM entities WHERE name=$1`, [o.entityName]);
+      if (!ent.rowCount)
+        throw new Error(`Entity with name ${o.entityName} not found`);
+      const added = [];
+      for (const c of o.contents || []) {
+        const r = await q(
+          `INSERT INTO observations(entity_name, content) VALUES ($1,$2)
+             ON CONFLICT (entity_name, content) DO NOTHING RETURNING content`,
+          [o.entityName, c]
+        );
+        if (r.rowCount) added.push(c);
+      }
+      out.push({ entityName: o.entityName, addedObservations: added });
+    }
+    return out;
+  },
+
+  async delete_entities({ entityNames = [] }) {
+    if (entityNames.length)
+      await q(`DELETE FROM entities WHERE name = ANY($1)`, [entityNames]);
+    return "Entities deleted successfully";
+  },
+
+  async delete_observations({ deletions = [] }) {
+    for (const d of deletions)
+      if ((d.observations || []).length)
+        await q(
+          `DELETE FROM observations WHERE entity_name=$1 AND content = ANY($2)`,
+          [d.entityName, d.observations]
+        );
+    return "Observations deleted successfully";
+  },
+
+  async delete_relations({ relations = [] }) {
+    for (const r of relations)
+      await q(
+        `DELETE FROM relations WHERE from_name=$1 AND to_name=$2 AND relation_type=$3`,
+        [r.from, r.to, r.relationType]
+      );
+    return "Relations deleted successfully";
+  },
+
+  async read_graph() {
+    return { entities: await entitiesWhere(), relations: await relationsAmong(null) };
+  },
+
+  async search_nodes({ query }) {
+    const like = `%${query}%`;
+    const entities = await entitiesWhere(
+      `WHERE e.name ILIKE $1 OR e.entity_type ILIKE $1
+         OR EXISTS (SELECT 1 FROM observations o2
+                    WHERE o2.entity_name = e.name AND o2.content ILIKE $1)`,
+      [like]
+    );
+    const names = entities.map((e) => e.name);
+    return { entities, relations: await relationsAmong(names) };
+  },
+
+  async open_nodes({ names = [] }) {
+    const entities = await entitiesWhere(`WHERE e.name = ANY($1)`, [names]);
+    return { entities, relations: await relationsAmong(names) };
+  },
+};
+
+// ---- tool schemas (mirror @modelcontextprotocol/server-memory) -------------
+const S = {
+  create_entities: {
+    description: "Create multiple new entities in the knowledge graph",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entities: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              entityType: { type: "string" },
+              observations: { type: "array", items: { type: "string" } },
+            },
+            required: ["name", "entityType", "observations"],
+          },
+        },
+      },
+      required: ["entities"],
+    },
+  },
+  create_relations: {
+    description:
+      "Create multiple new relations between entities. Relations should be in active voice",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              from: { type: "string" },
+              to: { type: "string" },
+              relationType: { type: "string" },
+            },
+            required: ["from", "to", "relationType"],
+          },
+        },
+      },
+      required: ["relations"],
+    },
+  },
+  add_observations: {
+    description: "Add new observations to existing entities in the knowledge graph",
+    inputSchema: {
+      type: "object",
+      properties: {
+        observations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              entityName: { type: "string" },
+              contents: { type: "array", items: { type: "string" } },
+            },
+            required: ["entityName", "contents"],
+          },
+        },
+      },
+      required: ["observations"],
+    },
+  },
+  delete_entities: {
+    description: "Delete multiple entities and their associated relations",
+    inputSchema: {
+      type: "object",
+      properties: { entityNames: { type: "array", items: { type: "string" } } },
+      required: ["entityNames"],
+    },
+  },
+  delete_observations: {
+    description: "Delete specific observations from entities",
+    inputSchema: {
+      type: "object",
+      properties: {
+        deletions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              entityName: { type: "string" },
+              observations: { type: "array", items: { type: "string" } },
+            },
+            required: ["entityName", "observations"],
+          },
+        },
+      },
+      required: ["deletions"],
+    },
+  },
+  delete_relations: {
+    description: "Delete multiple relations from the knowledge graph",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              from: { type: "string" },
+              to: { type: "string" },
+              relationType: { type: "string" },
+            },
+            required: ["from", "to", "relationType"],
+          },
+        },
+      },
+      required: ["relations"],
+    },
+  },
+  read_graph: {
+    description: "Read the entire knowledge graph",
+    inputSchema: { type: "object", properties: {} },
+  },
+  search_nodes: {
+    description: "Search for nodes in the knowledge graph based on a query",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  },
+  open_nodes: {
+    description: "Open specific nodes in the knowledge graph by their names",
+    inputSchema: {
+      type: "object",
+      properties: { names: { type: "array", items: { type: "string" } } },
+      required: ["names"],
+    },
+  },
+};
+
+const server = new Server(
+  { name: "pg-memory", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: Object.entries(S).map(([name, def]) => ({ name, ...def })),
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const name = req.params.name;
+  const fn = tools[name];
+  if (!fn) throw new Error(`Unknown tool: ${name}`);
+  const args = req.params.arguments || {};
+  try {
+    const gen = mirrorGen;
+    const result = await fn(args);
+    postSuccess[name]?.(args, result, gen);
+    markSynced();
+    return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+  } catch (err) {
+    if (!isNetworkError(err)) throw err;
+    if (name.startsWith("delete_"))
+      throw new Error(`typhoon PG unreachable — ${name} is not queued offline (deletes could clobber newer writes from other devices). Retry when online.`);
+    const off = offlineTools[name];
+    if (!off) throw err;
+    const result = off(args);
+    bumpGen();
+    const lastSync = getMeta("last_sync") || "never";
+    const pending = mdb.prepare(`SELECT COUNT(*) AS n FROM outbox`).get().n;
+    return {
+      content: [
+        { type: "text", text: `⚠ OFFLINE: typhoon PG unreachable. Served from local SQLite mirror (last sync: ${lastSync}; ${pending} queued write(s) will sync automatically).` },
+        { type: "text", text: JSON.stringify(result, null, 2) },
+      ],
+    };
+  }
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+
+// Background: replay any queued offline writes, then keep the mirror warm.
+const replayTimer = setInterval(() => { replayOutbox().catch(() => {}); }, 30_000);
+replayTimer.unref();
+replayOutbox().catch(() => {});
+// Initial mirror warm-up (non-blocking; ignores offline).
+{
+  const gen = mirrorGen;
+  tools.read_graph().then((g) => { safe(() => refreshMirror(g, gen)); markSynced(); }).catch(() => {});
+}
+
+console.error("pg-memory MCP server running on stdio (sqlite mirror + offline outbox active)");

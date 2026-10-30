@@ -1,0 +1,11 @@
+{
+  "name": "pg-memory-mcp",
+  "version": "1.0.0",
+  "description": "PostgreSQL-backed knowledge-graph memory MCP server (drop-in for @modelcontextprotocol/server-memory, shared across devices)",
+  "type": "module",
+  "bin": { "pg-memory-mcp": "index.js" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "pg": "^8.13.0"
+  }
+}

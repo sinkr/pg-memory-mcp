@@ -1,0 +1,305 @@
+#!/usr/bin/env node
+// PostgreSQL-backed memory MCP server. Drop-in replacement for
+// @modelcontextprotocol/server-memory: identical tool names and I/O shapes,
+// but state lives in Postgres so many devices/agents share one graph and
+// writes MERGE (upsert) instead of clobbering a whole JSON file.
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import {
+  CallToolRequestSchema,
+  ListToolsRequestSchema,
+} from "@modelcontextprotocol/sdk/types.js";
+import pg from "pg";
+import os from "node:os";
+
+const pool = new pg.Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 4,
+  application_name: `pg-memory-mcp/${process.env.MCP_HOST || os.hostname().split(".")[0]}-${process.env.MCP_DEVICE || "unknown"}`,
+});
+
+const q = (text, params) => pool.query(text, params);
+
+// ---- graph reads -----------------------------------------------------------
+async function entitiesWhere(clause = "", params = []) {
+  const { rows } = await q(
+    `SELECT e.name, e.entity_type AS "entityType",
+            COALESCE(array_agg(o.content ORDER BY o.id)
+                     FILTER (WHERE o.content IS NOT NULL), '{}') AS observations
+       FROM entities e
+       LEFT JOIN observations o ON o.entity_name = e.name
+       ${clause}
+       GROUP BY e.name, e.entity_type
+       ORDER BY e.name`,
+    params
+  );
+  return rows;
+}
+async function relationsAmong(names) {
+  if (names && names.length === 0) return [];
+  const { rows } = await q(
+    `SELECT from_name AS "from", to_name AS "to", relation_type AS "relationType"
+       FROM relations
+       ${names ? "WHERE from_name = ANY($1) AND to_name = ANY($1)" : ""}
+       ORDER BY from_name, to_name, relation_type`,
+    names ? [names] : []
+  );
+  return rows;
+}
+
+// ---- tool implementations --------------------------------------------------
+const tools = {
+  async create_entities({ entities = [] }) {
+    const created = [];
+    for (const e of entities) {
+      const r = await q(
+        `INSERT INTO entities(name, entity_type) VALUES ($1,$2)
+           ON CONFLICT (name) DO NOTHING RETURNING name`,
+        [e.name, e.entityType]
+      );
+      for (const c of e.observations || [])
+        await q(
+          `INSERT INTO observations(entity_name, content) VALUES ($1,$2)
+             ON CONFLICT (entity_name, content) DO NOTHING`,
+          [e.name, c]
+        );
+      if (r.rowCount) created.push(e); // newly created only, like the reference
+    }
+    return created;
+  },
+
+  async create_relations({ relations = [] }) {
+    const created = [];
+    for (const r of relations) {
+      const res = await q(
+        `INSERT INTO relations(from_name, to_name, relation_type) VALUES ($1,$2,$3)
+           ON CONFLICT DO NOTHING RETURNING 1`,
+        [r.from, r.to, r.relationType]
+      );
+      if (res.rowCount) created.push(r);
+    }
+    return created;
+  },
+
+  async add_observations({ observations = [] }) {
+    const out = [];
+    for (const o of observations) {
+      const ent = await q(`SELECT 1 FROM entities WHERE name=$1`, [o.entityName]);
+      if (!ent.rowCount)
+        throw new Error(`Entity with name ${o.entityName} not found`);
+      const added = [];
+      for (const c of o.contents || []) {
+        const r = await q(
+          `INSERT INTO observations(entity_name, content) VALUES ($1,$2)
+             ON CONFLICT (entity_name, content) DO NOTHING RETURNING content`,
+          [o.entityName, c]
+        );
+        if (r.rowCount) added.push(c);
+      }
+      out.push({ entityName: o.entityName, addedObservations: added });
+    }
+    return out;
+  },
+
+  async delete_entities({ entityNames = [] }) {
+    if (entityNames.length)
+      await q(`DELETE FROM entities WHERE name = ANY($1)`, [entityNames]);
+    return "Entities deleted successfully";
+  },
+
+  async delete_observations({ deletions = [] }) {
+    for (const d of deletions)
+      if ((d.observations || []).length)
+        await q(
+          `DELETE FROM observations WHERE entity_name=$1 AND content = ANY($2)`,
+          [d.entityName, d.observations]
+        );
+    return "Observations deleted successfully";
+  },
+
+  async delete_relations({ relations = [] }) {
+    for (const r of relations)
+      await q(
+        `DELETE FROM relations WHERE from_name=$1 AND to_name=$2 AND relation_type=$3`,
+        [r.from, r.to, r.relationType]
+      );
+    return "Relations deleted successfully";
+  },
+
+  async read_graph() {
+    return { entities: await entitiesWhere(), relations: await relationsAmong(null) };
+  },
+
+  async search_nodes({ query }) {
+    const like = `%${query}%`;
+    const entities = await entitiesWhere(
+      `WHERE e.name ILIKE $1 OR e.entity_type ILIKE $1
+         OR EXISTS (SELECT 1 FROM observations o2
+                    WHERE o2.entity_name = e.name AND o2.content ILIKE $1)`,
+      [like]
+    );
+    const names = entities.map((e) => e.name);
+    return { entities, relations: await relationsAmong(names) };
+  },
+
+  async open_nodes({ names = [] }) {
+    const entities = await entitiesWhere(`WHERE e.name = ANY($1)`, [names]);
+    return { entities, relations: await relationsAmong(names) };
+  },
+};
+
+// ---- tool schemas (mirror @modelcontextprotocol/server-memory) -------------
+const S = {
+  create_entities: {
+    description: "Create multiple new entities in the knowledge graph",
+    inputSchema: {
+      type: "object",
+      properties: {
+        entities: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              name: { type: "string" },
+              entityType: { type: "string" },
+              observations: { type: "array", items: { type: "string" } },
+            },
+            required: ["name", "entityType", "observations"],
+          },
+        },
+      },
+      required: ["entities"],
+    },
+  },
+  create_relations: {
+    description:
+      "Create multiple new relations between entities. Relations should be in active voice",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              from: { type: "string" },
+              to: { type: "string" },
+              relationType: { type: "string" },
+            },
+            required: ["from", "to", "relationType"],
+          },
+        },
+      },
+      required: ["relations"],
+    },
+  },
+  add_observations: {
+    description: "Add new observations to existing entities in the knowledge graph",
+    inputSchema: {
+      type: "object",
+      properties: {
+        observations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              entityName: { type: "string" },
+              contents: { type: "array", items: { type: "string" } },
+            },
+            required: ["entityName", "contents"],
+          },
+        },
+      },
+      required: ["observations"],
+    },
+  },
+  delete_entities: {
+    description: "Delete multiple entities and their associated relations",
+    inputSchema: {
+      type: "object",
+      properties: { entityNames: { type: "array", items: { type: "string" } } },
+      required: ["entityNames"],
+    },
+  },
+  delete_observations: {
+    description: "Delete specific observations from entities",
+    inputSchema: {
+      type: "object",
+      properties: {
+        deletions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              entityName: { type: "string" },
+              observations: { type: "array", items: { type: "string" } },
+            },
+            required: ["entityName", "observations"],
+          },
+        },
+      },
+      required: ["deletions"],
+    },
+  },
+  delete_relations: {
+    description: "Delete multiple relations from the knowledge graph",
+    inputSchema: {
+      type: "object",
+      properties: {
+        relations: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              from: { type: "string" },
+              to: { type: "string" },
+              relationType: { type: "string" },
+            },
+            required: ["from", "to", "relationType"],
+          },
+        },
+      },
+      required: ["relations"],
+    },
+  },
+  read_graph: {
+    description: "Read the entire knowledge graph",
+    inputSchema: { type: "object", properties: {} },
+  },
+  search_nodes: {
+    description: "Search for nodes in the knowledge graph based on a query",
+    inputSchema: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"],
+    },
+  },
+  open_nodes: {
+    description: "Open specific nodes in the knowledge graph by their names",
+    inputSchema: {
+      type: "object",
+      properties: { names: { type: "array", items: { type: "string" } } },
+      required: ["names"],
+    },
+  },
+};
+
+const server = new Server(
+  { name: "pg-memory", version: "1.0.0" },
+  { capabilities: { tools: {} } }
+);
+
+server.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: Object.entries(S).map(([name, def]) => ({ name, ...def })),
+}));
+
+server.setRequestHandler(CallToolRequestSchema, async (req) => {
+  const fn = tools[req.params.name];
+  if (!fn) throw new Error(`Unknown tool: ${req.params.name}`);
+  const result = await fn(req.params.arguments || {});
+  return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+});
+
+const transport = new StdioServerTransport();
+await server.connect(transport);
+console.error("pg-memory MCP server running on stdio");
